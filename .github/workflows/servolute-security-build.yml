@@ -1,0 +1,313 @@
+# Servolute security build for the patched Documenso fork.
+#
+# Runs on pushes to the security branch only. It:
+#   1. lints and typechecks the files touched by the two security fixes,
+#   2. runs the focused Playwright e2e tests for both fixes against the patched code,
+#   3. re-runs the security tests with the fixes reverted to prove they fail without them,
+#   4. builds the Docker image from docker/Dockerfile (never pushed anywhere) and scans it with Trivy.
+#
+# No secrets are used. Nothing is published to a registry.
+
+name: Servolute security build
+
+on:
+  push:
+    branches: ['security-fixes-v2.18.0']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: servolute-security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_BASE_TAG: v2.18.0
+  # Source files changed by the two security fixes (reverted in the "unpatched" control run).
+  FIX_FILES: >-
+    apps/remix/server/api/download/download.ts
+    apps/remix/server/api/files/files.helpers.ts
+    apps/remix/server/api/files/files.ts
+    apps/remix/server/api/files/routes/get-envelope-item-pdf.ts
+    packages/lib/server-only/field/sign-field-with-token.ts
+  # Test files added or extended for the two fixes.
+  TEST_FILES: >-
+    packages/app-tests/e2e/api/v2/unauthorized-api-access/api-access-file-visibility.spec.ts
+    packages/app-tests/e2e/document-auth/assistant-signing-auth.spec.ts
+  # Security tests that must fail on unpatched v2.18.0 and pass once patched.
+  SECURITY_TEST_GREP: 'hides an? |\(V1\) rejects an assistant signing'
+  SECURITY_TEST_COUNT: '5'
+
+jobs:
+  lint_typecheck:
+    name: Lint and typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Copy env
+        run: cp .env.example .env
+
+      - uses: ./.github/actions/node-install
+
+      - name: Biome check (touched files)
+        run: npx biome check $FIX_FILES $TEST_FILES
+
+      - name: Typecheck remix app (includes lib, trpc and api imports)
+        run: npm run typecheck -w @documenso/remix
+
+      - name: Typecheck app-tests (fail only on errors in touched test files)
+        run: |
+          set +e
+          npx tsc --noEmit -p packages/app-tests/tsconfig.json > tsc-app-tests.txt 2>&1
+          status=$?
+          set -e
+          total=$(grep -c 'error TS' tsc-app-tests.txt || true)
+          echo "app-tests tsc exit=$status, total errors=$total"
+          ours=0
+          for f in $TEST_FILES; do
+            rel="${f#packages/app-tests/}"
+            if grep -F "$rel" tsc-app-tests.txt | grep -q 'error TS'; then
+              grep -F "$rel" tsc-app-tests.txt
+              ours=1
+            fi
+          done
+          if [ "$ours" -ne 0 ]; then
+            echo "Type errors in touched test files"
+            exit 1
+          fi
+          if [ "$total" -gt 0 ]; then
+            echo "::notice::app-tests has $total pre-existing type errors outside the touched files"
+          fi
+
+  e2e:
+    name: E2E (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, unpatched]
+    env:
+      NEXT_PRIVATE_SIGNING_LOCAL_FILE_PATH: './example/cert.p12'
+      DANGEROUS_BYPASS_RATE_LIMITS: 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Revert the security fixes (control run)
+        if: matrix.variant == 'unpatched'
+        run: |
+          git checkout "$UPSTREAM_BASE_TAG" -- $FIX_FILES
+          git status --short
+
+      - name: Copy env
+        run: cp .env.example .env
+
+      - uses: ./.github/actions/node-install
+
+      - name: Start services
+        run: npm run dx:up
+
+      - name: Create the database
+        run: npm run prisma:migrate-dev
+
+      - name: Seed the database
+        run: npm run prisma:seed
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Build app
+        run: npx turbo run build --filter=@documenso/remix
+
+      - name: Start app
+        run: |
+          nohup npm run start -w @documenso/remix > app-server.log 2>&1 &
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://localhost:3000/api/health; then
+              echo "App is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App did not start"
+          tail -n 200 app-server.log
+          exit 1
+
+      - name: Run tests (patched, must pass)
+        if: matrix.variant == 'patched'
+        working-directory: packages/app-tests
+        env:
+          CI: ''
+          NODE_ENV: test
+          NODE_OPTIONS: '--import tsx'
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+        run: |
+          npx playwright test \
+            e2e/api/v2/unauthorized-api-access/api-access-file-visibility.spec.ts \
+            e2e/api/v2/unauthorized-api-access/api-access-file-download.spec.ts \
+            e2e/api/v2/unauthorized-api-access/api-access-envelope-cert-audit-log.spec.ts \
+            e2e/api/v2/partial-signed-pdf-download.spec.ts \
+            e2e/api/v2/embedding-presign.spec.ts \
+            e2e/document-auth/assistant-signing-auth.spec.ts \
+            e2e/document-auth/next-recipient-dictation.spec.ts \
+            e2e/templates/organisation-templates.spec.ts \
+            --reporter=list,json --retries=2 --workers=4
+
+      - name: Run security tests (unpatched, must all fail)
+        if: matrix.variant == 'unpatched'
+        working-directory: packages/app-tests
+        env:
+          CI: ''
+          NODE_ENV: test
+          NODE_OPTIONS: '--import tsx'
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+        run: |
+          set +e
+          npx playwright test \
+            e2e/api/v2/unauthorized-api-access/api-access-file-visibility.spec.ts \
+            e2e/document-auth/assistant-signing-auth.spec.ts \
+            --grep "$SECURITY_TEST_GREP" \
+            --reporter=list,json --retries=0 --workers=4
+          echo "playwright exit code: $?"
+          set -e
+
+          jq -r '[.. | objects | select(has("specs")) | .specs[]] | .[] | "\(.ok)\t\(.title)"' results.json | tee spec-results.tsv
+
+          total=$(wc -l < spec-results.tsv | tr -d ' ')
+          passed=$(grep -c '^true' spec-results.tsv || true)
+
+          echo "Security tests run: $total (expected $SECURITY_TEST_COUNT), passed without fixes: $passed"
+
+          if [ "$total" -ne "$SECURITY_TEST_COUNT" ]; then
+            echo "::error::Expected $SECURITY_TEST_COUNT security tests, ran $total"
+            exit 1
+          fi
+
+          if [ "$passed" -ne 0 ]; then
+            echo "::error::$passed security test(s) passed without the fixes, so they do not prove the fix"
+            exit 1
+          fi
+
+          echo "All $total security tests fail on unpatched $UPSTREAM_BASE_TAG, as expected."
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-${{ matrix.variant }}
+          path: |
+            packages/app-tests/results.json
+            packages/app-tests/spec-results.tsv
+            packages/app-tests/playwright-report
+            packages/app-tests/test-results
+            app-server.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  docker_trivy:
+    name: Docker build and Trivy scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build Docker image (not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          push: false
+          load: true
+          tags: documenso-servolute:${{ github.sha }}
+
+      - name: Trivy scan (table)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: documenso-servolute:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: table
+          output: trivy-results.txt
+          exit-code: '0'
+          timeout: 20m0s
+
+      - name: Trivy scan (SARIF)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: documenso-servolute:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: true
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+          timeout: 20m0s
+          skip-setup-trivy: true
+
+      - name: Trivy scan (JSON)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: documenso-servolute:${{ github.sha }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: json
+          output: trivy-results.json
+          exit-code: '0'
+          timeout: 20m0s
+          skip-setup-trivy: true
+
+      - name: Trivy summary
+        run: |
+          cat trivy-results.txt
+
+          {
+            echo "## Trivy image scan (HIGH, CRITICAL)"
+            echo
+            echo "| Severity | Count | Fixable |"
+            echo "| --- | --- | --- |"
+            for sev in CRITICAL HIGH; do
+              count=$(jq --arg s "$sev" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s)] | length' trivy-results.json)
+              fixable=$(jq --arg s "$sev" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s and (.FixedVersion // "") != "")] | length' trivy-results.json)
+              echo "| $sev | $count | $fixable |"
+            done
+            echo
+            echo "### By target"
+            echo
+            echo "| Target | Class | CRITICAL | HIGH |"
+            echo "| --- | --- | --- | --- |"
+            jq -r '.Results[]? | select((.Vulnerabilities // []) | length > 0) | "| \(.Target) | \(.Class) | \([.Vulnerabilities[] | select(.Severity == "CRITICAL")] | length) | \([.Vulnerabilities[] | select(.Severity == "HIGH")] | length) |"' trivy-results.json
+            echo
+            echo "### Findings"
+            echo
+            echo "| Severity | ID | Package | Installed | Fixed | Target |"
+            echo "| --- | --- | --- | --- | --- | --- |"
+            jq -r '.Results[]? as $r | $r.Vulnerabilities[]? | "| \(.Severity) | \(.VulnerabilityID) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion // "") | \($r.Target) |"' trivy-results.json | sort -u
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.txt
+            trivy-results.sarif
+            trivy-results.json
+          retention-days: 30
+          if-no-files-found: ignore
