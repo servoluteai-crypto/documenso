@@ -118,8 +118,19 @@ jobs:
       # Only the services the e2e tests need. The dev compose file also pulls minio/minio,
       # which is no longer published on Docker Hub (pre-existing upstream breakage), and
       # builds gotenberg, which is only used for DOCX conversion.
+      # Retried because the compose file publishes host ports in the Linux ephemeral range
+      # (e.g. 54320), which an outbound connection on the runner can briefly hold.
       - name: Start services
-        run: docker compose -f docker/development/compose.yml up -d --wait database inbucket redis
+        run: |
+          for attempt in 1 2 3; do
+            if docker compose -f docker/development/compose.yml up -d --wait database inbucket redis; then
+              exit 0
+            fi
+            echo "Service start attempt $attempt failed, retrying"
+            docker compose -f docker/development/compose.yml down || true
+            sleep 10
+          done
+          exit 1
 
       - name: Create the database
         run: npm run prisma:migrate-dev
