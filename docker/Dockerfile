@@ -6,6 +6,12 @@ FROM node:24-alpine3.23 AS base
 RUN apk add --no-cache openssl
 RUN apk add --no-cache font-freefont
 
+# Replace the npm bundled with Node (24.21.0 ships npm 11.19.0, whose bundled
+# brace-expansion 5.0.7, ip-address 10.2.0 and tar 7.5.19 have HIGH advisories)
+# with the version pinned in package.json "packageManager". npm stays in the
+# image because start.sh runs `npx prisma migrate deploy` at startup.
+RUN npm install -g npm@11.19.1 && npm cache clean --force
+
 
 ###########################
 #    BUILDER CONTAINER    #
