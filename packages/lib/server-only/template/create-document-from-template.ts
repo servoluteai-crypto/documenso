@@ -453,6 +453,12 @@ export const createDocumentFromTemplate = async ({
 
       if (foundCustomDocumentData) {
         documentDataIdToDuplicate = foundCustomDocumentData.documentDataId;
+
+        await assertCanUseCustomDocumentData({
+          documentDataId: foundCustomDocumentData.documentDataId,
+          userId,
+          teamId,
+        });
       }
 
       const documentDataToDuplicate = await prisma.documentData.findFirst({
@@ -796,4 +802,59 @@ export const createDocumentFromTemplate = async ({
   ]);
 
   return envelope;
+};
+
+type AssertCanUseCustomDocumentDataOptions = {
+  documentDataId: string;
+  userId: number;
+  teamId: number;
+};
+
+/**
+ * `DocumentData` has no owner, and custom document data IDs come from the caller.
+ *
+ * Only allow document data that is not attached to an envelope yet (a fresh upload), or
+ * that belongs to an envelope the caller can already read. Otherwise a caller who learns
+ * another envelope's document data ID could copy its PDF into their own document.
+ */
+const assertCanUseCustomDocumentData = async ({
+  documentDataId,
+  userId,
+  teamId,
+}: AssertCanUseCustomDocumentDataOptions) => {
+  const envelopeItem = await prisma.envelopeItem.findFirst({
+    where: {
+      documentDataId,
+    },
+    select: {
+      envelopeId: true,
+    },
+  });
+
+  if (!envelopeItem) {
+    return;
+  }
+
+  const { envelopeWhereInput } = await getEnvelopeWhereInput({
+    id: {
+      type: 'envelopeId',
+      id: envelopeItem.envelopeId,
+    },
+    type: null,
+    userId,
+    teamId,
+  });
+
+  const envelope = await prisma.envelope.findFirst({
+    where: envelopeWhereInput,
+    select: {
+      id: true,
+    },
+  });
+
+  if (!envelope) {
+    throw new AppError(AppErrorCode.NOT_FOUND, {
+      message: 'Document data not found',
+    });
+  }
 };

@@ -2,8 +2,9 @@ import { NEXT_PUBLIC_WEBAPP_URL } from '@documenso/lib/constants/app';
 import { hashString } from '@documenso/lib/server-only/auth/hash';
 import { createTeam } from '@documenso/lib/server-only/team/create-team';
 import { alphaid } from '@documenso/lib/universal/id';
+import { mapSecondaryIdToTemplateId } from '@documenso/lib/utils/envelope';
 import { prisma } from '@documenso/prisma';
-import { DocumentVisibility, TeamMemberRole, TemplateType } from '@documenso/prisma/client';
+import { DocumentDataType, DocumentVisibility, TeamMemberRole, TemplateType } from '@documenso/prisma/client';
 import { seedCompletedDocument } from '@documenso/prisma/seed/documents';
 import { seedTeam, seedTeamMember } from '@documenso/prisma/seed/teams';
 import { seedBlankTemplate } from '@documenso/prisma/seed/templates';
@@ -213,5 +214,87 @@ test.describe('Envelope file routes - organisation template visibility', () => {
 
     expect(res.ok()).toBeTruthy();
     expect(res.headers()['content-type']).toContain('application/pdf');
+  });
+});
+
+test.describe('Template use - custom document data ownership', () => {
+  const useTemplate = (
+    request: APIRequestContext,
+    token: string,
+    template: { secondaryId: string },
+    customDocumentDataId: string,
+  ) => {
+    return request.post(`${WEBAPP_BASE_URL}/api/v2-beta/template/use`, {
+      headers: { Authorization: `Bearer ${token}` },
+      data: {
+        templateId: mapSecondaryIdToTemplateId(template.secondaryId),
+        recipients: [],
+        customDocumentDataId,
+      },
+    });
+  };
+
+  test('rejects another team document data as custom document data', async ({ request }) => {
+    const { user: victim, team: victimTeam } = await seedUser();
+    const { user: attacker, team: attackerTeam } = await seedUser();
+
+    const victimDocument = await seedCompletedDocument(victim, victimTeam.id, ['recipient@test.documenso.com']);
+    const attackerTemplate = await seedBlankTemplate(attacker, attackerTeam.id);
+
+    const { token } = await seedApiTokenForUser({ userId: attacker.id, teamId: attackerTeam.id });
+
+    const res = await useTemplate(request, token, attackerTemplate, victimDocument.envelopeItems[0].documentDataId);
+
+    expect(res.ok()).toBeFalsy();
+    expect(res.status()).toBe(404);
+  });
+
+  test('rejects the document data of an ADMIN-only document for a team MEMBER', async ({ request }) => {
+    const { team, owner, member, document } = await seedTeamDocument(DocumentVisibility.ADMIN);
+    const template = await seedBlankTemplate(owner, team.id);
+
+    const { token } = await seedApiTokenForUser({ userId: member.id, teamId: team.id });
+
+    const res = await useTemplate(request, token, template, document.envelopeItems[0].documentDataId);
+
+    expect(res.ok()).toBeFalsy();
+    expect(res.status()).toBe(404);
+  });
+
+  test('still allows a fresh upload as custom document data', async ({ request }) => {
+    const { user, team } = await seedUser();
+    const template = await seedBlankTemplate(user, team.id);
+
+    const { documentData: templateDocumentData } = await prisma.envelopeItem.findFirstOrThrow({
+      where: { envelopeId: template.id },
+      include: { documentData: true },
+    });
+
+    // Not attached to any envelope item, like the result of `/api/files/upload-pdf`.
+    const freshUpload = await prisma.documentData.create({
+      data: {
+        type: DocumentDataType.BYTES_64,
+        data: templateDocumentData.data,
+        initialData: templateDocumentData.initialData,
+      },
+    });
+
+    const { token } = await seedApiTokenForUser({ userId: user.id, teamId: team.id });
+
+    const res = await useTemplate(request, token, template, freshUpload.id);
+
+    expect(res.ok()).toBeTruthy();
+  });
+
+  test('still allows the document data of a document the caller can read', async ({ request }) => {
+    const { user, team } = await seedUser();
+    const template = await seedBlankTemplate(user, team.id);
+    const document = await seedCompletedDocument(user, team.id, ['recipient@test.documenso.com']);
+
+    const { token } = await seedApiTokenForUser({ userId: user.id, teamId: team.id });
+
+    const res = await useTemplate(request, token, template, document.envelopeItems[0].documentDataId);
+
+    expect(res.ok()).toBeTruthy();
   });
 });
