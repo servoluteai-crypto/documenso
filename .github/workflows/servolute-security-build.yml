@@ -1,8 +1,8 @@
 # Servolute security build for the patched Documenso fork.
 #
 # Runs on pushes to the security branch only. It:
-#   1. lints and typechecks the files touched by the two security fixes,
-#   2. runs the focused Playwright e2e tests for both fixes against the patched code,
+#   1. lints and typechecks the files touched by the security fixes,
+#   2. runs the focused Playwright e2e tests for the fixes against the patched code,
 #   3. re-runs the security tests with the fixes reverted to prove they fail without them,
 #   4. builds the Docker image from docker/Dockerfile (never pushed anywhere) and scans it with Trivy.
 #
@@ -24,20 +24,21 @@ concurrency:
 
 env:
   UPSTREAM_BASE_TAG: v2.18.0
-  # Source files changed by the two security fixes (reverted in the "unpatched" control run).
+  # Source files changed by the security fixes (reverted in the "unpatched" control run).
   FIX_FILES: >-
     apps/remix/server/api/download/download.ts
     apps/remix/server/api/files/files.helpers.ts
     apps/remix/server/api/files/files.ts
     apps/remix/server/api/files/routes/get-envelope-item-pdf.ts
     packages/lib/server-only/field/sign-field-with-token.ts
-  # Test files added or extended for the two fixes.
+    packages/lib/server-only/template/create-document-from-template.ts
+  # Test files added or extended for the fixes.
   TEST_FILES: >-
     packages/app-tests/e2e/api/v2/unauthorized-api-access/api-access-file-visibility.spec.ts
     packages/app-tests/e2e/document-auth/assistant-signing-auth.spec.ts
   # Security tests that must fail on unpatched v2.18.0 and pass once patched.
-  SECURITY_TEST_GREP: 'hides an? |\(V1\) rejects an assistant signing'
-  SECURITY_TEST_COUNT: '5'
+  SECURITY_TEST_GREP: 'hides an? |\(V1\) rejects an assistant signing|rejects (another team document data|the document data of an ADMIN)'
+  SECURITY_TEST_COUNT: '7'
 
 jobs:
   lint_typecheck:
@@ -114,8 +115,11 @@ jobs:
 
       - uses: ./.github/actions/node-install
 
+      # Only the services the e2e tests need. The dev compose file also pulls minio/minio,
+      # which is no longer published on Docker Hub (pre-existing upstream breakage), and
+      # builds gotenberg, which is only used for DOCX conversion.
       - name: Start services
-        run: npm run dx:up
+        run: docker compose -f docker/development/compose.yml up -d --wait database inbucket redis
 
       - name: Create the database
         run: npm run prisma:migrate-dev
