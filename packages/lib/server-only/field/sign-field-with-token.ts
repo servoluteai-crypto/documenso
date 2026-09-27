@@ -13,6 +13,7 @@ import { match } from 'ts-pattern';
 import { AUTO_SIGNABLE_FIELD_TYPES } from '../../constants/autosign';
 import { DEFAULT_DOCUMENT_DATE_FORMAT } from '../../constants/date-formats';
 import { DEFAULT_DOCUMENT_TIME_ZONE } from '../../constants/time-zones';
+import { AppError, AppErrorCode } from '../../errors/app-error';
 import { DOCUMENT_AUDIT_LOG_TYPE } from '../../types/document-audit-logs';
 import type { TRecipientActionAuth } from '../../types/document-auth';
 import {
@@ -99,6 +100,18 @@ export const signFieldWithToken = async ({
 
   if (!recipient) {
     throw new Error(`Recipient not found for field ${field.id}`);
+  }
+
+  // Assistants may prefill fields on behalf of later recipients, but must never sign for them.
+  // Mirrors the guard in the V2 `envelope.field.sign` route.
+  if (
+    (field.type === FieldType.SIGNATURE || field.type === FieldType.FREE_SIGNATURE) &&
+    recipient.id !== field.recipientId &&
+    recipient.role === RecipientRole.ASSISTANT
+  ) {
+    throw new AppError(AppErrorCode.INVALID_REQUEST, {
+      message: `Assistant recipients cannot sign signature fields`,
+    });
   }
 
   if (envelope.deletedAt) {

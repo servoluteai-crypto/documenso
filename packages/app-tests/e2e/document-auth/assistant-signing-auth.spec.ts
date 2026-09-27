@@ -161,3 +161,135 @@ test.describe('[ASSISTANT_SIGNING_AUTH]: cross-envelope field access', () => {
     expect(fieldAfter.recipient.signingStatus).toBe(SigningStatus.NOT_SIGNED);
   });
 });
+
+type SeededAssistantEnvelope = {
+  assistantToken: string;
+  signerSignatureFieldId: number;
+  signerTextFieldId: number;
+};
+
+/**
+ * Seeds a single pending envelope with an ASSISTANT (signing order 1) followed by
+ * a SIGNER (signing order 2) who owns a SIGNATURE field and a TEXT field.
+ */
+const seedAssistantEnvelope = async (request: APIRequestContext): Promise<SeededAssistantEnvelope> => {
+  const { envelope, distributeResult } = await apiSeedPendingDocument(request, {
+    title: '[TEST] Assistant Signature Guard',
+    recipients: [
+      {
+        email: `assistant-${Date.now()}@documenso.com`,
+        name: 'Assistant',
+        role: 'ASSISTANT',
+        signingOrder: 1,
+      },
+      {
+        email: `signer-${Date.now()}@documenso.com`,
+        name: 'Signer',
+        role: 'SIGNER',
+        signingOrder: 2,
+      },
+    ],
+    fieldsPerRecipient: [
+      [],
+      [
+        { type: FieldType.SIGNATURE, page: 1, positionX: 5, positionY: 5, width: 5, height: 5 },
+        { type: FieldType.TEXT, page: 1, positionX: 5, positionY: 15, width: 5, height: 5 },
+      ],
+    ],
+  });
+
+  const assistant = distributeResult.recipients.find((r) => r.role === 'ASSISTANT');
+
+  if (!assistant) {
+    throw new Error('Assistant recipient not found');
+  }
+
+  const { fields } = await prisma.envelope.findUniqueOrThrow({
+    where: { id: envelope.id },
+    include: { fields: true },
+  });
+
+  const signatureField = fields.find((f) => f.type === FieldType.SIGNATURE);
+  const textField = fields.find((f) => f.type === FieldType.TEXT);
+
+  if (!signatureField || !textField) {
+    throw new Error('Signer fields not found');
+  }
+
+  return {
+    assistantToken: assistant.token,
+    signerSignatureFieldId: signatureField.id,
+    signerTextFieldId: textField.id,
+  };
+};
+
+test.describe('[ASSISTANT_SIGNING_AUTH]: assistant cannot sign on behalf of another recipient', () => {
+  test('field.signFieldWithToken (V1) rejects an assistant signing another recipient signature field', async ({
+    request,
+  }) => {
+    const { assistantToken, signerSignatureFieldId } = await seedAssistantEnvelope(request);
+
+    const res = await trpcMutation(request, 'field.signFieldWithToken', {
+      token: assistantToken,
+      fieldId: signerSignatureFieldId,
+      value: 'Forged Signature',
+      isBase64: false,
+    });
+
+    expect(res.ok()).toBeFalsy();
+    expect(await res.text()).toContain('Assistant recipients cannot sign signature fields');
+
+    const fieldAfter = await prisma.field.findUniqueOrThrow({
+      where: { id: signerSignatureFieldId },
+      include: { signature: true },
+    });
+
+    expect(fieldAfter.inserted).toBe(false);
+    expect(fieldAfter.signature).toBeNull();
+  });
+
+  test('envelope.field.sign (V2) rejects an assistant signing another recipient signature field', async ({
+    request,
+  }) => {
+    const { assistantToken, signerSignatureFieldId } = await seedAssistantEnvelope(request);
+
+    const res = await trpcMutation(request, 'envelope.field.sign', {
+      token: assistantToken,
+      fieldId: signerSignatureFieldId,
+      fieldValue: { type: FieldType.SIGNATURE, value: 'Forged Signature' },
+    });
+
+    expect(res.ok()).toBeFalsy();
+    expect(await res.text()).toContain('Assistant recipients cannot sign signature fields');
+
+    const fieldAfter = await prisma.field.findUniqueOrThrow({
+      where: { id: signerSignatureFieldId },
+      include: { signature: true },
+    });
+
+    expect(fieldAfter.inserted).toBe(false);
+    expect(fieldAfter.signature).toBeNull();
+  });
+
+  test('field.signFieldWithToken (V1) still allows an assistant to prefill another recipient text field', async ({
+    request,
+  }) => {
+    const { assistantToken, signerTextFieldId } = await seedAssistantEnvelope(request);
+
+    const res = await trpcMutation(request, 'field.signFieldWithToken', {
+      token: assistantToken,
+      fieldId: signerTextFieldId,
+      value: 'Prefilled by assistant',
+      isBase64: false,
+    });
+
+    expect(res.ok()).toBeTruthy();
+
+    const fieldAfter = await prisma.field.findUniqueOrThrow({
+      where: { id: signerTextFieldId },
+    });
+
+    expect(fieldAfter.inserted).toBe(true);
+    expect(fieldAfter.customText).toBe('Prefilled by assistant');
+  });
+});
